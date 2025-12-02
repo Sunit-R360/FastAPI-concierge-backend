@@ -6,7 +6,7 @@ import re, os, json
 
 app = FastAPI(
     title="Autocomplete API",
-    docs_url="/swagger",
+    docs_url="/swagger",           # Swagger UI
     redoc_url=None,
     openapi_url="/api/openapi.json",
 )
@@ -25,7 +25,7 @@ class Suggestion(BaseModel):
     type: Optional[str] = None
 
 
-# small curated lists used for the flow
+# staged suggestion lists
 INITIAL_PHRASES = [
     {"display": "I want to book a", "type": "starter"},
     {"display": "Book me a", "type": "starter"},
@@ -42,7 +42,7 @@ CONNECTORS = [
     {"display": "to", "type": "connector"},
 ]
 
-# example city lists — extend as you like or load from a file
+# simplified city lists (example); replace or load as needed
 CITIES = [
     {"display": "Chhatrapati Shivaji Maharaj International Airport, Mumbai (BOM)", "type": "city"},
     {"display": "Indira Gandhi International Airport, New Delhi (DEL)", "type": "city"},
@@ -54,82 +54,129 @@ CITIES = [
     {"display": "Goa Dabolim International Airport, Goa (GOI)", "type": "city"},
 ]
 
-# helper normalizer
+
+DEFAULT_LIMIT = 1  # internal default when we want a single suggestion by default
+
+
 def norm(s: str) -> str:
     return s.strip().lower()
 
 
-def starts_with_token(item_display: str, token: str) -> bool:
-    return norm(item_display).startswith(norm(token))
+def find_matching_list(query_token: str, candidates: List[dict], prefer_all=False) -> List[dict]:
+    """
+    Return candidates that start with token, or all candidates if token is empty or no matches.
+    If prefer_all=True, always return full candidates list (for steps where we want multiple choices).
+    """
+    if prefer_all:
+        # still apply prefix filtering to order if token present
+        if not query_token:
+            return candidates
+        token = query_token.lower()
+        pref = [c for c in candidates if norm(c["display"]).startswith(token)]
+        return pref if pref else candidates
 
-
-def find_matching_list(query_token: str, candidates: List[dict]) -> List[dict]:
-    """Return candidates that start with token, or all candidates if token empty or no matches"""
     if not query_token:
-        return candidates
+        # default behavior: return only a small default set for empty token
+        return candidates[: max(len(candidates), DEFAULT_LIMIT)]
     token = query_token.lower()
     filtered = [c for c in candidates if norm(c["display"]).startswith(token)]
     return filtered if filtered else candidates
 
 
 @app.get("/autocomplete", response_model=List[Suggestion])
-def autocomplete(q: Optional[str] = Query("", description="Query string"), limit: int = Query(10, ge=1, le=50)):
+def autocomplete(q: Optional[str] = Query("", description="Query string")):
     """
-    Rule-based staged suggestions:
-      - empty -> INITIAL_PHRASES
-      - after starter phrase (I want to book a / Book me a / Find me a) -> SERVICES (flight/hotel)
-      - after `flight` present but no `from` -> suggest `from`
-      - after `from` but no city -> city list
-      - after `from <city>` but no `to` -> suggest `to`
-      - after `to` but no destination city -> destination city list
-    Prefix-matching is performed on the current token.
+    Staged autocomplete flow (no 'limit' query param exposed in swagger):
+
+    - empty -> INITIAL_PHRASES (show 3 starters)
+    - after starter -> SERVICES (flight/hotel)
+    - after 'flight' present & no 'from' -> suggest 'from'
+    - after 'from' and no city -> suggest cities
+    - after 'from <city>' and no 'to' -> suggest 'to'
+    - after 'to' and no destination -> suggest cities (destinations)
+    - after destination selected -> suggest number of people (default: '1 adult')
+    - after people selected -> suggest seat preferences
+    - after seat selected -> suggest meal preferences
     """
 
     raw = (q or "")
     q_stripped = raw.strip()
     q_lower = q_stripped.lower()
 
-    # token user is currently typing = last run of non-space characters (empty if trailing space)
-    # e.g. "I want to book a f" -> token 'f'
+    # current token: last run of non-space characters (empty if trailing space)
     m = re.search(r"(\S+)\s*$", raw)
     current_token = m.group(1) if m else ""
-    # if raw ends with a space, we want empty current token (new token)
     if raw.endswith(" "):
+        # trailing space means the user finished the token — treat as empty token for next suggestions
         current_token = ""
 
-    # 1) if nothing typed -> show initial starters
+    # 1) if nothing typed -> show initial starters (all 3)
     if not q_stripped:
-        return INITIAL_PHRASES[:limit]
+        return [Suggestion(**d) for d in INITIAL_PHRASES]
 
-    # 2) if user started one of the starter phrases, offer services (flight/hotel) if not present
+    # Helper flags
+    has_flight = "flight" in q_lower
+    has_hotel = "hotel" in q_lower
+    has_from = re.search(r"\bfrom\b", q_lower) is not None
+    has_to = re.search(r"\bto\b", q_lower) is not None
+
+    # ---------- Stage: after starter -> services ----------
     starters = ["i want to book a", "book me a", "find me a"]
     if any(q_lower.startswith(s) for s in starters):
-        # if neither flight nor hotel present, suggest services
-        if "flight" not in q_lower and "hotel" not in q_lower:
-            return find_matching_list(current_token, SERVICES)[:limit]
+        # offer both services (flight, hotel) — show both so user can choose
+        if not has_flight and not has_hotel:
+            return [Suggestion(**d) for d in find_matching_list(current_token, SERVICES, prefer_all=True)]
 
-    # 3) if sentence contains 'flight' and 'from' not present -> suggest 'from'
-    if "flight" in q_lower and "from" not in q_lower:
-        return find_matching_list(current_token, [{"display": "from", "type": "connector"}])[:limit]
+    # ---------- Stage: when flight selected -> suggest 'from' if not yet present ----------
+    if has_flight and not has_from:
+        return [Suggestion(**d) for d in find_matching_list(current_token, [{"display": "from", "type": "connector"}])]
 
-    # 4) if sentence has 'from' but no city after it -> suggest city list
-    #    detect pattern 'from' not followed by a non-space token (or followed by token equal to current_token)
-    if re.search(r"\bfrom\b", q_lower):
-        # extract substring after 'from'
+    # ---------- Stage: after 'from' -> suggest cities ----------
+    if has_from:
+        # what is after 'from'?
         after_from = re.split(r"\bfrom\b", q_lower, maxsplit=1)[1].strip()
-        # if nothing after from or after_from equals current_token => suggest city
+        # if nothing typed after 'from' or the current token equals what's after_from, suggest cities
         if not after_from or (current_token and after_from == current_token.lower()):
-            return find_matching_list(current_token, CITIES)[:limit]
-        # otherwise we've got a city after 'from' -> proceed to suggest 'to' if not present
-        if "to" not in q_lower:
-            return find_matching_list(current_token, [{"display": "to", "type": "connector"}])[:limit]
+            # for cities we usually want multiple choices shown (prefer_all=True)
+            return [Suggestion(**d) for d in find_matching_list(current_token, CITIES, prefer_all=True)]
 
-    # 5) if sentence contains 'to' but no destination city after it -> suggest city list (destinations)
-    if re.search(r"\bto\b", q_lower):
+        # if a city is present after 'from' and 'to' is not yet present -> suggest 'to'
+        if after_from and not has_to:
+            return [Suggestion(**d) for d in find_matching_list(current_token, [{"display": "to", "type": "connector"}])]
+
+    # ---------- Stage: after 'to' -> destination cities ----------
+    if has_to:
         after_to = re.split(r"\bto\b", q_lower, maxsplit=1)[1].strip()
         if not after_to or (current_token and after_to == current_token.lower()):
-            return find_matching_list(current_token, CITIES)[:limit]
+            # show city options for destination
+            return [Suggestion(**d) for d in find_matching_list(current_token, CITIES, prefer_all=True)]
 
-    # Fallback: if none of the above, fall back to small default suggestions (services)
-    # You can expand this to a fuzzy search over a larger dataset.
-    return find_matching_list(current_token, SERVICES + CITIES)[:limit]
+        # destination present and user finished destination (i.e. there is some dest text and token is empty)
+        # => next stage is number of people
+        # detect presence of a people spec (simple heuristics)
+    # ---------- Stage: after destination chosen -> suggest people ----------
+    # Consider we've selected destination if both 'from' and 'to' appear and there's a non-empty token after 'to'
+    has_destination = False
+    if has_from and has_to:
+        after_to = re.split(r"\bto\b", q_lower, maxsplit=1)[1].strip()
+        if after_to:
+            # a destination token exists (may be multi-word); treat as destination selected
+            has_destination = True
+
+    if has_destination and not re.search(r"\b(adult|adults|child|children)\b", q_lower):
+        # user hasn't selected number of people yet; suggest PEOPLE (default '1 adult' first)
+        # return full people list to let them choose, but we prefer '1 adult' as the first suggestion
+        return [Suggestion(**d) for d in find_matching_list(current_token, PEOPLE, prefer_all=True)]
+
+    # ---------- Stage: after people selected -> suggest seat prefs ----------
+    if re.search(r"\b(adult|adults|child|children)\b", q_lower) and not re.search(r"\b(window|aisle|middle|any)\b", q_lower):
+        # suggest seat preferences
+        return [Suggestion(**d) for d in find_matching_list(current_token, SEATS, prefer_all=True)]
+
+    # ---------- Stage: after seat selected -> suggest meal prefs ----------
+    if re.search(r"\b(window|aisle|middle|any)\b", q_lower) and not re.search(r"\b(vegetarian|non-vegetarian|vegan|kosher|halal|no preference)\b", q_lower):
+        return [Suggestion(**d) for d in find_matching_list(current_token, MEALS, prefer_all=True)]
+
+    # Fallback: if none of the staged rules matched, return service + city hints (small set).
+    fallback = SERVICES + CITIES
+    return [Suggestion(**d) for d in find_matching_list(current_token, fallback)]
