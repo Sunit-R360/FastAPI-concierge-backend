@@ -54,6 +54,32 @@ CITIES = [
     {"display": "Goa Dabolim International Airport, Goa (GOI)", "type": "city"},
 ]
 
+# people options
+PEOPLE = [
+    {"display": "1 adult", "type": "people"},
+    {"display": "2 adults", "type": "people"},
+    {"display": "1 child", "type": "people"},
+    {"display": "2 adults 1 child", "type": "people"},
+]
+
+# seat preferences
+SEATS = [
+    {"display": "Window", "type": "seat"},
+    {"display": "Aisle", "type": "seat"},
+    {"display": "Middle", "type": "seat"},
+    {"display": "Any", "type": "seat"},
+]
+
+# meal preferences
+MEALS = [
+    {"display": "Vegetarian", "type": "meal"},
+    {"display": "Non-vegetarian", "type": "meal"},
+    {"display": "Vegan", "type": "meal"},
+    {"display": "Kosher", "type": "meal"},
+    {"display": "Halal", "type": "meal"},
+    {"display": "No preference", "type": "meal"},
+]
+
 
 DEFAULT_LIMIT = 1  # internal default when we want a single suggestion by default
 
